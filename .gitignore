@@ -1,0 +1,35 @@
+# Build outputs (Visual Studio multi-config layout and CMake artifacts).
+# Anchored to the repository root so an unrelated directory deeper in the tree
+# that happens to be called "out" is not silently ignored.
+/build/
+/dist/
+/out/
+*.pyd
+*.dll
+*.lib
+*.exp
+*.obj
+*.ilk
+*.pdb
+
+# Local machine notes (paths, toolchain environment, verified build invocations)
+LOCAL_DEV.md
+
+# Reference material cloned for reading. Never a build dependency, and never
+# committed: some of it carries no license.
+/refs/
+
+# Benchmark inputs, products, and golden fixtures derived from them. The
+# datasets are not ours to redistribute; prepare_data.py fetches them locally.
+/bench/data/
+/bench/out/
+/bench/fixtures/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Scratch: profiler reports, ad-hoc drivers, and other throwaway measurement
+# artifacts. Never part of the deliverable.
+/.test_tmp/

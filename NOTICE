@@ -1,0 +1,39 @@
+Third-party material used by, or consulted while building, this sub-project.
+
+Vendored build dependencies (submodules; their own licenses apply in full)
+--------------------------------------------------------------------------------
+pybind11            extern/pybind11            BSD-3-Clause style license
+                    https://github.com/pybind/pybind11
+                    License text: extern/pybind11/LICENSE
+
+Eigen               extern/eigen               MPL-2.0 (header-only)
+                    https://gitlab.com/libeigen/eigen
+                    License text: extern/eigen/COPYING.MPL2
+                    Used by the CPU reference route; compiled into the module,
+                    never shipped as a separate library.
+
+Reference material consulted (dev-only, not linked into the module)
+--------------------------------------------------------------------------------
+trimesh             MIT                        Reference implementation behind
+                                               the benchmark harness and the
+                                               golden fixtures; installed as a
+                                               development dependency only.
+
+weigao95/surfelwarp BSD-3-Clause               Read-only architecture
+                                               reference for the device-side
+                                               solver. Any copied fragment keeps
+                                               this notice.
+
+hwdong/deformation_graph
+                    No license                 Ideas only (graph construction
+                                               approach). Not cloned into the
+                                               repository, no code copied.
+
+Benchmark datasets
+--------------------------------------------------------------------------------
+The benchmark datasets are not distributed with this repository. They are
+obtained locally by the user (see bench/README.md) and stay untracked; no
+dataset content is committed. They are the TOSCA high-resolution pairs, and the
+paired shapes used here follow the train/test split published with the Sumner &
+Popovic deformation-transfer data. Cite the original dataset publications when
+publishing results measured on them.

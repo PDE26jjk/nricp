@@ -1,0 +1,72 @@
+{
+  "config_version": 1,
+  "note": "Pinned benchmark configuration. Acceptance numbers are only comparable when this file is used unchanged; every run and every fixture records it.",
+  "pairs": [
+    {"name": "cat0->cat3", "template": "cat0", "target": "cat3"},
+    {"name": "david0->david1", "template": "david0", "target": "david1"},
+    {"name": "michael0->michael2", "template": "michael0", "target": "michael2"},
+    {"name": "victoria0->victoria2", "template": "victoria0", "target": "victoria2"}
+  ],
+  "template_vertices": 4000,
+  "target_vertices": 3500,
+  "landmarks": 25,
+  "rigid_init": {
+    "method": "landmark_procrustes",
+    "note": "Closed-form Kabsch fit over the landmark correspondences: no sampling and no iteration, so a prepared case is reproducible run to run. The 'icp' method is kept for comparison only (its surface sampling is not seedable, so it is not reproducible).",
+    "seed": 0,
+    "source_samples": 2000,
+    "target_samples": 4000,
+    "max_iterations": 40,
+    "threshold": 1e-06
+  },
+  "distance_threshold": {
+    "fraction_of_diagonal": 0.05
+  },
+  "gates": {
+    "note": "Acceptance is anchored on the recorded reference baseline: per pair the native solver must stay within the tolerances below of the best result the reference implementation reached on that pair. The absolute targets are reported for context only - the reference implementation itself does not reach them on every pair, which is why they are not gates.",
+    "baseline": "config/reference_baseline.json",
+    "relative": {
+      "corr_mean_ratio": 1.05,
+      "corr_p95_ratio": 1.1,
+      "stretch_p95_margin": 0.05,
+      "foldover_margin": 0.01
+    },
+    "targets": {
+      "corr_mean": 2.1,
+      "corr_mean_fraction_of_diagonal": 0.01,
+      "stretch_p95": 0.5,
+      "foldover": 0.0
+    }
+  },
+  "reference": {
+    "amberg": {
+      "steps": [[0.01, 100.0, 0.5, 10], [0.02, 50.0, 0.5, 10], [0.03, 20.0, 0.5, 10], [0.01, 10.0, 0.0, 10]],
+      "note": "steps are (smoothness, landmark weight, normal weight, max iterations); this is the tuned schedule that reaches the documented numbers, and the landmark column is what makes or breaks the result"
+    },
+    "sumner": {
+      "steps": null,
+      "note": "null keeps the library's default schedule, whose landmark weight is 1000"
+    }
+  },
+  "solver": {
+    "note": "Schedule of the native solver. It is deliberately not part of the configuration fingerprint: the reference baseline means the same thing whatever our own schedule is. Status: under tuning. Tuned with bench/experiments/schedule_sweep.py; measured over the four pairs by bench/compare_to_reference.py: cat0->cat3 corr_mean 1.69 (better than the reference's 2.07, but foldover 1.38% against 1.32% allowed), david0->david1 3.00 against 3.05 (passes), michael0->michael2 2.51 against 3.22 (passes, better than the reference), victoria0->victoria2 2.38 against 2.05 (16% over; stretch 0.439 against 0.435). Levers still untested: more levels, more inner iterations, the slope filter, and a per-pair look at the landmark schedule.",
+    "levels": 4,
+    "nodes_initial": 100,
+    "node_growth": 2,
+    "smoothness_weight": [10.0, 20.0, 30.0, 10.0],
+    "point_to_plane_weight": [1.0, 1.0, 1.0, 1.0],
+    "point_to_point_ratio": 1.0,
+    "landmark_weight": [3000.0, 1500.0, 600.0, 300.0],
+    "anchor_weight": 0.001,
+    "robust_kernel": "huber",
+    "robust_threshold_fraction_of_diagonal": 0.05,
+    "max_outer_iterations": 10,
+    "max_inner_iterations": 10,
+    "outer_tolerance": 0.0001,
+    "inner_tolerance": 0.00001,
+    "min_normal_cosine": 0.0,
+    "min_slope": 0.0,
+    "pcg_tolerance": 1e-05,
+    "pcg_max_iterations": 60
+  }
+}

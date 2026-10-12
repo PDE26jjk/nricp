@@ -1,0 +1,13 @@
+# Development-only dependencies: the test harness, the benchmark runner, and the
+# golden-reference regeneration. Nothing here is a runtime dependency of the
+# extension module, which needs no package beyond what the interpreter already
+# ships (Blender 5.2 bundles Python 3.13 and numpy).
+#
+# The mesh library is the reference implementation the acceptance numbers come
+# from. Its non-rigid ICP sources were verified identical between 5.0.0 and
+# 5.1.1, so the range is safe; the exact version used is recorded with every
+# stored result.
+numpy>=2.0
+scipy>=1.11
+trimesh>=5.0,<6
+pytest>=8.0

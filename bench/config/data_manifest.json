@@ -1,0 +1,84 @@
+{
+  "files": {
+    "cat0.tri": {
+      "sha256": "b896479f764566767e9fc6e26c6d42de000effe30ae4c87987c92f025e6048db",
+      "size": 992087,
+      "source": "cat0.tri"
+    },
+    "cat0.vert": {
+      "sha256": "76231374d6216468f2ebe54c739a69557f4b40a92156d9c32a1cc92fd594301a",
+      "size": 872650,
+      "source": "cat0.vert"
+    },
+    "cat3.tri": {
+      "sha256": "b896479f764566767e9fc6e26c6d42de000effe30ae4c87987c92f025e6048db",
+      "size": 992087,
+      "source": "cat3.tri"
+    },
+    "cat3.vert": {
+      "sha256": "fba1d2a9af9be84c5d0b40754c8c90fceb27dd309c5a6f6c866cf1502fb3b529",
+      "size": 900426,
+      "source": "cat3.vert"
+    },
+    "david0.tri": {
+      "sha256": "8b16a09a5f24960b7406d5d2b66356bbb2a303f675f4deac2779286664267c9f",
+      "size": 1928863,
+      "source": "david0.tri"
+    },
+    "david0.vert": {
+      "sha256": "3ade328baf72caa52ab877462cf5ee2c9ad56367b88575d35ed4e0a3052daedf",
+      "size": 1661446,
+      "source": "david0.vert"
+    },
+    "david1.tri": {
+      "sha256": "8b16a09a5f24960b7406d5d2b66356bbb2a303f675f4deac2779286664267c9f",
+      "size": 1928863,
+      "source": "david1.tri"
+    },
+    "david1.vert": {
+      "sha256": "8b778e0f67c672f9b78851dac72a399d6fc7099d4ca64d1899574941d7aa451c",
+      "size": 1693381,
+      "source": "david1.vert"
+    },
+    "michael0.tri": {
+      "sha256": "a94271d4a49d3367fa10c6e462b09121e054c8055c1870709016bc7ea8229608",
+      "size": 1928874,
+      "source": "michael0.tri"
+    },
+    "michael0.vert": {
+      "sha256": "ccb8c83b1e6167f0c35907f11e0c12362c4a4696ee6faf325b27dbb2ab3366f6",
+      "size": 1698289,
+      "source": "michael0.vert"
+    },
+    "michael2.tri": {
+      "sha256": "a94271d4a49d3367fa10c6e462b09121e054c8055c1870709016bc7ea8229608",
+      "size": 1928874,
+      "source": "michael2.tri"
+    },
+    "michael2.vert": {
+      "sha256": "cbb087798f9a9a2b863b4f4289796cab9fd52f89a934204ebdd954d82f72234a",
+      "size": 1667819,
+      "source": "michael2.vert"
+    },
+    "victoria0.tri": {
+      "sha256": "9d898a41fa2bdcd643e435c2c728a82ad393ed0fb37443b37e1f605df6a0d82d",
+      "size": 1666482,
+      "source": "victoria0.tri"
+    },
+    "victoria0.vert": {
+      "sha256": "0c4a8fb7f4e95a525c97a35929850fbccaf520c668878d34b02541f945a151fb",
+      "size": 1443302,
+      "source": "victoria0.vert"
+    },
+    "victoria2.tri": {
+      "sha256": "9d898a41fa2bdcd643e435c2c728a82ad393ed0fb37443b37e1f605df6a0d82d",
+      "size": 1666482,
+      "source": "victoria2.tri"
+    },
+    "victoria2.vert": {
+      "sha256": "15050a18f32b0758bd62d612b7da8ca396f6b7166d7d451b8ef0a5cb4e677a4d",
+      "size": 1430312,
+      "source": "victoria2.vert"
+    }
+  }
+}
