@@ -420,6 +420,261 @@ static __global__ void scatter_bound_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// The node-pair structure
+//
+// A vertex bound to several nodes contributes a cross block J_a^T J_b between
+// every pair of those nodes. Route A has always assembled them (its
+// `interactions_` map); the device path wrote only each node's own diagonal, so
+// it was minimising a weaker Hessian -- the energies and the gradient were
+// right, the curvature was not, and the missing part showed up as four to six
+// times the inner iterations.
+//
+// The pairs are the same for every iteration of a level -- they come from the
+// bindings -- so they are derived once: key each (vertex, slot pair) by its
+// sorted node pair, sort, and run-length the keys into groups. A group is an
+// "edge" with two nodes as far as the solve is concerned, so the groups are
+// simply appended to the graph's edge list and the same block solver consumes
+// them.
+// ---------------------------------------------------------------------------
+
+// One entry per pair of a vertex's slots that land on two different nodes; slot
+// pairs that land on the same node belong to that node's own block and are
+// handled by the gathered pass.
+static __global__ void count_pairs_kernel(
+    const int* __restrict__ binding_nodes, const int* __restrict__ binding_counts,
+    const float* __restrict__ binding_weights, int vertex_count,
+    int* __restrict__ counts) {
+    const int vertex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vertex >= vertex_count) {
+        return;
+    }
+    int nodes[4];
+    int slots = 0;
+    const int count = binding_counts[vertex];
+    for (int slot = 0; slot < count; ++slot) {
+        const int node = binding_nodes[vertex * 4 + slot];
+        if (node < 0 || binding_weights[vertex * 4 + slot] == 0.0f) {
+            continue;
+        }
+        nodes[slots++] = node;
+    }
+    int pairs = 0;
+    for (int a = 0; a < slots; ++a) {
+        for (int b = a + 1; b < slots; ++b) {
+            if (nodes[a] != nodes[b]) {
+                ++pairs;
+            }
+        }
+    }
+    counts[vertex] = pairs;
+}
+
+static __global__ void emit_pairs_kernel(
+    const int* __restrict__ binding_nodes, const int* __restrict__ binding_counts,
+    const float* __restrict__ binding_weights, const int* __restrict__ begins,
+    int vertex_count, int node_count, unsigned long long* __restrict__ keys,
+    unsigned long long* __restrict__ payload) {
+    const int vertex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vertex >= vertex_count) {
+        return;
+    }
+    int slot_of[4];
+    int nodes[4];
+    int slots = 0;
+    const int count = binding_counts[vertex];
+    for (int slot = 0; slot < count; ++slot) {
+        const int node = binding_nodes[vertex * 4 + slot];
+        if (node < 0 || binding_weights[vertex * 4 + slot] == 0.0f) {
+            continue;
+        }
+        slot_of[slots] = slot;
+        nodes[slots] = node;
+        ++slots;
+    }
+    int at = begins[vertex];
+    for (int a = 0; a < slots; ++a) {
+        for (int b = a + 1; b < slots; ++b) {
+            if (nodes[a] == nodes[b]) {
+                continue;
+            }
+            const int low = nodes[a] < nodes[b] ? nodes[a] : nodes[b];
+            const int high = nodes[a] < nodes[b] ? nodes[b] : nodes[a];
+            const int low_slot = nodes[a] < nodes[b] ? slot_of[a] : slot_of[b];
+            const int high_slot = nodes[a] < nodes[b] ? slot_of[b] : slot_of[a];
+            keys[at] = static_cast<unsigned long long>(low) * node_count + high;
+            payload[at] = (static_cast<unsigned long long>(vertex) << 4) |
+                          (static_cast<unsigned long long>(low_slot) << 2) |
+                          static_cast<unsigned long long>(high_slot);
+            ++at;
+        }
+    }
+}
+
+// Marks the first entry of each run of equal keys, so an inclusive scan turns
+// the keys into group indices.
+static __global__ void mark_group_starts_kernel(
+    const unsigned long long* __restrict__ keys, int count, int* __restrict__ flags) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) {
+        return;
+    }
+    flags[index] = (index == 0 || keys[index] != keys[index - 1]) ? 1 : 0;
+}
+
+static __global__ void scatter_group_begin_kernel(
+    const int* __restrict__ group_of_entry, int count, int* __restrict__ begins) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) {
+        return;
+    }
+    if (index == 0 || group_of_entry[index] != group_of_entry[index - 1]) {
+        // One writer per group, so a plain store is enough.
+        begins[group_of_entry[index] - 1] = index;
+    }
+}
+
+// The tail of the edge list: the groups' node pairs, which is all the block
+// solver needs to know about them.
+static __global__ void fill_pair_edges_kernel(
+    const unsigned long long* __restrict__ keys, const int* __restrict__ begins,
+    int group_count, int node_count, int* __restrict__ edge_nodes) {
+    const int group = blockIdx.x * blockDim.x + threadIdx.x;
+    if (group >= group_count) {
+        return;
+    }
+    const unsigned long long key = keys[begins[group]];
+    edge_nodes[group * 2 + 0] = static_cast<int>(key / node_count);
+    edge_nodes[group * 2 + 1] = static_cast<int>(key % node_count);
+}
+
+// The cross blocks themselves, laid out like the gathered node pass: one block
+// per group, its threads striding over the group's entries with a 6x6 in
+// registers each, one reduction, one write. A single thread per group was the
+// first attempt and it is the wrong shape -- there are far fewer groups than
+// entries (a few thousand groups against a few hundred thousand entries at a
+// hundred thousand vertices), so it left the device nearly idle while a handful
+// of threads walked dozens of entries each.
+//
+// Only the block is written: a row's contribution to the gradient goes to its
+// own node's right-hand side, which the gathered pass already did.
+static __global__ void assemble_pair_kernel(
+    const float* points, const float* node_rest, const int* binding_nodes,
+    const float* binding_weights, const int* binding_counts, const Mat3f* rotations,
+    const float* translations, const float* correspondence_points,
+    const float* correspondence_normals, const unsigned char* rejection,
+    const float* robust_weights, const unsigned char* mask,
+    const unsigned long long* payload, const int* group_begin, int group_count,
+    int entry_count, const float* landmark_flag, const float* landmark_targets,
+    float point_weight, float plane_weight, float landmark_weight,
+    int graph_edge_count, Mat6f* pair_blocks) {
+    const int group = blockIdx.x;
+    if (group >= group_count) {
+        return;
+    }
+    const int begin = group_begin[group];
+    const int end = group + 1 < group_count ? group_begin[group + 1] : entry_count;
+    float block[kBlockValues];
+    for (int i = 0; i < kBlockValues; ++i) {
+        block[i] = 0.0f;
+    }
+    for (int index = begin + threadIdx.x; index < end; index += blockDim.x) {
+        const unsigned long long packed = payload[index];
+        const int vertex = static_cast<int>(packed >> 4);
+        const int slot_a = static_cast<int>((packed >> 2) & 0x3);
+        const int slot_b = static_cast<int>(packed & 0x3);
+        const bool carry_data =
+            rejection[vertex] == 0 && (mask == nullptr || mask[vertex] != 0);
+        const Vec3f point = load_vec3(points, vertex);
+        const int count = binding_counts[vertex];
+        const float robust = robust_weights[vertex];
+        Vec3f deformed;
+        for (int slot = 0; slot < count; ++slot) {
+            const int node = binding_nodes[vertex * 4 + slot];
+            const float weight = binding_weights[vertex * 4 + slot];
+            if (weight == 0.0f || node < 0) {
+                continue;
+            }
+            const Vec3f rest = load_vec3(node_rest, node);
+            deformed += (rotations[node] * (point - rest) + rest +
+                         load_vec3(translations, node)) *
+                        weight;
+        }
+        const int node_a = binding_nodes[vertex * 4 + slot_a];
+        const int node_b = binding_nodes[vertex * 4 + slot_b];
+        const float weight_a = binding_weights[vertex * 4 + slot_a];
+        const float weight_b = binding_weights[vertex * 4 + slot_b];
+        const Vec3f rotated_a =
+            node_rotated_offset(rotations, node_rest, node_a, point);
+        const Vec3f rotated_b =
+            node_rotated_offset(rotations, node_rest, node_b, point);
+        const Vec3f offset = deformed - load_vec3(correspondence_points, vertex);
+        const Vec3f normal = load_vec3(correspondence_normals, vertex);
+
+        // One row of the pair's outer product: A[a][b] += J_a^T J_b, which is
+        // not symmetric on its own, so both halves of the group's two nodes are
+        // produced by the same row rather than by transposing.
+        const auto add_pair = [&](const Vec3f& lambda, float scale) {
+            float jacobian_a[6];
+            float jacobian_b[6];
+            fill_linear_row(lambda, rotated_a, scale * weight_a, jacobian_a);
+            fill_linear_row(lambda, rotated_b, scale * weight_b, jacobian_b);
+            for (int row = 0; row < 6; ++row) {
+                const float lhs = jacobian_a[row];
+                for (int column = 0; column < 6; ++column) {
+                    block[row * 6 + column] += lhs * jacobian_b[column];
+                }
+            }
+        };
+        if (carry_data) {
+            if (point_weight > 0.0f) {
+                const float scale = sqrtf(point_weight * robust);
+                for (int row = 0; row < 3; ++row) {
+                    const Vec3f axis = row == 0   ? Vec3f{1.0f, 0.0f, 0.0f}
+                                       : row == 1 ? Vec3f{0.0f, 1.0f, 0.0f}
+                                                  : Vec3f{0.0f, 0.0f, 1.0f};
+                    add_pair(axis, scale);
+                }
+            }
+            if (plane_weight > 0.0f) {
+                add_pair(normal, sqrtf(plane_weight * robust));
+            }
+        }
+        const float landmark =
+            (landmark_flag == nullptr || landmark_flag[vertex] == 0.0f)
+                ? 0.0f
+                : landmark_weight;
+        if (landmark > 0.0f) {
+            const float scale = sqrtf(landmark);
+            for (int row = 0; row < 3; ++row) {
+                const Vec3f axis = row == 0   ? Vec3f{1.0f, 0.0f, 0.0f}
+                                   : row == 1 ? Vec3f{0.0f, 1.0f, 0.0f}
+                                              : Vec3f{0.0f, 0.0f, 1.0f};
+                add_pair(axis, scale);
+            }
+        }
+    }
+    Mat6f& target = pair_blocks[graph_edge_count + group];
+    __shared__ float staged[kGatherThreads][kBlockValues + 1];
+    for (int i = 0; i < kBlockValues; ++i) {
+        staged[threadIdx.x][i] = block[i];
+    }
+    __syncthreads();
+    for (int span = blockDim.x / 2; span > 0; span >>= 1) {
+        if (threadIdx.x < span) {
+            for (int i = 0; i < kBlockValues; ++i) {
+                staged[threadIdx.x][i] += staged[threadIdx.x + span][i];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < kBlockValues; ++i) {
+            target.m[i] = staged[0][i];
+        }
+    }
+}
+
 static __global__ void assemble_node_kernel(
     const float* points, const float* node_rest, const int* binding_nodes,
     const float* binding_weights, const int* binding_counts, const Mat3f* rotations,
@@ -1114,6 +1369,20 @@ struct GpuLevel {
     thrust::device_vector<int> gather_cursor;
     thrust::device_vector<int> gather_counts;
     thrust::device_vector<int> gather_vertex;
+    // The node pairs that share a bound vertex. A vertex bound to several nodes
+    // puts a cross block between every pair of those nodes into the system, and
+    // one entry per (vertex, slot pair) with the same node pair is one group.
+    // The groups are appended to the edge list, because a group *is* an edge with
+    // two nodes as far as the solve is concerned.
+    thrust::device_vector<unsigned long long> pair_keys;
+    thrust::device_vector<unsigned long long> pair_payload;
+    thrust::device_vector<int> pair_vertex_begin;
+    thrust::device_vector<int> pair_flags;
+    thrust::device_vector<int> pair_group_of_entry;
+    thrust::device_vector<int> pair_group_begin;
+    int pair_count = 0;        // entries emitted by this level
+    int pair_group_count = 0;  // distinct node pairs
+    int total_edge_count = 0;  // graph edges followed by the pair groups
     thrust::device_vector<Mat3f> rotations;
     thrust::device_vector<float> translations;
     thrust::device_vector<Mat3f> rotations_backup;
@@ -1157,6 +1426,15 @@ void reserve_level(GpuLevel& state, int max_nodes, int max_edges, int vertex_cou
     state.gather_cursor = thrust::device_vector<int>(max_nodes);
     state.gather_counts = thrust::device_vector<int>(max_nodes);
     state.gather_vertex = thrust::device_vector<int>(vertex_count * 4);
+    // A vertex has at most six slot pairs, so this is the most entries any level
+    // can emit and the most groups it can produce.
+    const std::size_t pair_capacity = static_cast<std::size_t>(vertex_count) * 6;
+    state.pair_keys = thrust::device_vector<unsigned long long>(pair_capacity);
+    state.pair_payload = thrust::device_vector<unsigned long long>(pair_capacity);
+    state.pair_vertex_begin = thrust::device_vector<int>(vertex_count + 1);
+    state.pair_flags = thrust::device_vector<int>(pair_capacity);
+    state.pair_group_of_entry = thrust::device_vector<int>(pair_capacity);
+    state.pair_group_begin = thrust::device_vector<int>(pair_capacity + 1);
     state.rotations = thrust::device_vector<Mat3f>(max_nodes);
     state.translations = thrust::device_vector<float>(max_nodes * 3);
     state.rotations_backup = thrust::device_vector<Mat3f>(max_nodes);
@@ -1239,6 +1517,73 @@ void load_level(GpuLevel& state, const GraphLevel& level, int vertex_count,
         thrust::raw_pointer_cast(state.gather_cursor.data()),
         thrust::raw_pointer_cast(state.gather_vertex.data()));
     throw_on_cuda_error(cudaGetLastError());
+
+    // ---- the node-pair groups ----
+    const int* bound_nodes = thrust::raw_pointer_cast(state.binding_nodes.data());
+    const int* bound_counts = thrust::raw_pointer_cast(state.binding_counts.data());
+    const float* bound_weights =
+        thrust::raw_pointer_cast(state.binding_weights.data());
+    int* vertex_begin = thrust::raw_pointer_cast(state.pair_vertex_begin.data());
+    unsigned long long* keys = thrust::raw_pointer_cast(state.pair_keys.data());
+    unsigned long long* payload = thrust::raw_pointer_cast(state.pair_payload.data());
+    int* flags = thrust::raw_pointer_cast(state.pair_flags.data());
+    int* group_of_entry = thrust::raw_pointer_cast(state.pair_group_of_entry.data());
+    int* group_begin = thrust::raw_pointer_cast(state.pair_group_begin.data());
+
+    thrust::fill(par, state.pair_flags.begin(),
+                 state.pair_flags.begin() + vertex_count, 0);
+    count_pairs_kernel<<<blocks_for(vertex_count), kThreads, 0, stream>>>(
+        bound_nodes, bound_counts, bound_weights, vertex_count, flags);
+    throw_on_cuda_error(cudaGetLastError());
+    thrust::fill(par, state.pair_vertex_begin.begin(),
+                 state.pair_vertex_begin.begin() + 1, 0);
+    thrust::inclusive_scan(par, state.pair_flags.begin(),
+                           state.pair_flags.begin() + vertex_count,
+                           state.pair_vertex_begin.begin() + 1);
+    // The one number the host needs here, because it sizes the arrays: how many
+    // entries the level produced.
+    throw_on_cuda_error(cudaMemcpyAsync(&state.pair_count, vertex_begin + vertex_count,
+                                        sizeof(int), cudaMemcpyDeviceToHost, stream));
+    throw_on_cuda_error(cudaStreamSynchronize(stream));
+    state.pair_group_count = 0;
+    if (state.pair_count > 0) {
+        emit_pairs_kernel<<<blocks_for(vertex_count), kThreads, 0, stream>>>(
+            bound_nodes, bound_counts, bound_weights, vertex_begin, vertex_count,
+            state.node_count, keys, payload);
+        throw_on_cuda_error(cudaGetLastError());
+        thrust::sort_by_key(par, state.pair_keys.begin(),
+                            state.pair_keys.begin() + state.pair_count,
+                            state.pair_payload.begin());
+        mark_group_starts_kernel<<<blocks_for(state.pair_count), kThreads, 0, stream>>>(
+            keys, state.pair_count, flags);
+        throw_on_cuda_error(cudaGetLastError());
+        thrust::inclusive_scan(par, state.pair_flags.begin(),
+                               state.pair_flags.begin() + state.pair_count,
+                               state.pair_group_of_entry.begin());
+        scatter_group_begin_kernel<<<blocks_for(state.pair_count), kThreads, 0,
+                                     stream>>>(group_of_entry, state.pair_count,
+                                               group_begin);
+        throw_on_cuda_error(cudaGetLastError());
+        int last_group = 0;
+        throw_on_cuda_error(cudaMemcpyAsync(&last_group,
+                                            group_of_entry + state.pair_count - 1,
+                                            sizeof(int), cudaMemcpyDeviceToHost, stream));
+        throw_on_cuda_error(cudaStreamSynchronize(stream));
+        state.pair_group_count = last_group;
+    }
+    state.total_edge_count = state.edge_count + state.pair_group_count;
+
+    // The groups are appended to the edge list: to the block solver they are
+    // edges like any other, which is what lets it consume them unchanged.
+    state.edges.resize(static_cast<std::size_t>(state.total_edge_count) * 2);
+    state.edge_blocks.resize(std::max(state.total_edge_count, 1));
+    if (state.pair_group_count > 0) {
+        fill_pair_edges_kernel<<<blocks_for(state.pair_group_count), kThreads, 0,
+                                 stream>>>(
+            keys, group_begin, state.pair_group_count, state.node_count,
+            thrust::raw_pointer_cast(state.edges.data()) + state.edge_count * 2);
+        throw_on_cuda_error(cudaGetLastError());
+    }
 }
 
 // A pinned staging buffer for the handful of scalars the schedule has to see.
@@ -1533,6 +1878,33 @@ EnergyReadout RouteBSession::State::accumulate(
             level.node_count, thrust::raw_pointer_cast(level.diagonal.data()),
             thrust::raw_pointer_cast(level.rhs.data()));
         throw_on_cuda_error(cudaGetLastError());
+        if (level.pair_group_count > 0) {
+            // One block per group, like the gathered node pass.
+            assemble_pair_kernel<<<dim3(level.pair_group_count), kGatherThreads, 0,
+                                   stream>>>(
+                thrust::raw_pointer_cast(points.data()),
+                thrust::raw_pointer_cast(level.node_rest.data()),
+                thrust::raw_pointer_cast(level.binding_nodes.data()),
+                thrust::raw_pointer_cast(level.binding_weights.data()),
+                thrust::raw_pointer_cast(level.binding_counts.data()),
+                thrust::raw_pointer_cast(level.rotations.data()),
+                thrust::raw_pointer_cast(level.translations.data()),
+                thrust::raw_pointer_cast(level.correspondence_points.data()),
+                thrust::raw_pointer_cast(level.correspondence_normals.data()),
+                thrust::raw_pointer_cast(level.rejection.data()),
+                thrust::raw_pointer_cast(level.robust_weights.data()), mask_pointer,
+                thrust::raw_pointer_cast(level.pair_payload.data()),
+                thrust::raw_pointer_cast(level.pair_group_begin.data()),
+                level.pair_group_count, level.pair_count,
+                thrust::raw_pointer_cast(landmark_flag.data()),
+                thrust::raw_pointer_cast(landmark_target.data()),
+                static_cast<float>(settings_for_level.weights.point_to_point),
+                static_cast<float>(settings_for_level.weights.point_to_plane),
+                static_cast<float>(settings_for_level.weights.landmark),
+                level.edge_count,
+                thrust::raw_pointer_cast(level.edge_blocks.data()));
+            throw_on_cuda_error(cudaGetLastError());
+        }
     }
     accumulate_anchor_kernel<<<blocks_for(level.node_count), kThreads, 0, stream>>>(
         level.node_count, thrust::raw_pointer_cast(level.rotations.data()),
@@ -1673,7 +2045,9 @@ PcgOutcome RouteBSession::State::solve_system(float damping_value) {
     Mat6f* factor = thrust::raw_pointer_cast(level.factor.data());
     Mat6f* edge_blocks = thrust::raw_pointer_cast(level.edge_blocks.data());
     int* edges = thrust::raw_pointer_cast(level.edges.data());
-    int edge_count = level.edge_count;
+    // The block solver sees the graph's edges and the node-pair groups as one
+    // list: a group is an edge with two nodes.
+    int edge_count = level.total_edge_count;
     float* rhs = thrust::raw_pointer_cast(level.rhs.data());
     bool diagonal_scaling = settings.diagonal_damping;
     int node_count = level.node_count;
