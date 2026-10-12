@@ -1420,10 +1420,10 @@ PYBIND11_MODULE(nricp_dp, m) {
         "Dense expansion of the reduced system (verification only).");
 
     const auto route_arguments = [](py::module_& module, const char* name,
-                                    const char* doc, bool use_device) {
+                                    const char* doc, const char* method) {
         module.def(
             name,
-            [use_device](
+            [method](
                 const DoubleArray& template_points, const IndexArray& template_faces,
                 const DoubleArray& target_points, const IndexArray& target_faces,
                 const py::list& level_settings, const py::object& mask,
@@ -1434,6 +1434,8 @@ PYBIND11_MODULE(nricp_dp, m) {
                 int max_damping_attempts, bool diagonal_damping, int graph_levels,
                 int nodes_initial, int growth, double pcg_tolerance,
                 int pcg_max_iterations) {
+                const std::string requested = method;
+                const bool use_device = requested != "route_a";
                 PreparedSolve prepared = prepare_solve(
                     template_points, template_faces, target_points, target_faces,
                     level_settings, mask, landmark_indices, landmark_targets,
@@ -1447,16 +1449,21 @@ PYBIND11_MODULE(nricp_dp, m) {
                 // device, so the core layer's is only built for the route that
                 // traverses it.
                 nricp::RouteResult solved;
-                if (use_device) {
-                    solved = nricp::solve_route_b(
-                        prepared.normalized_template, prepared.normalized_target,
-                        prepared.graph, prepared.settings, mask_pointer,
-                        prepared.landmarks);
-                } else {
+                if (!use_device) {
                     const nricp::TargetQueries queries(prepared.normalized_target);
                     solved = nricp::solve_route_a(
                         prepared.normalized_template, queries, prepared.graph,
                         prepared.settings, mask_pointer, prepared.landmarks);
+                } else if (requested == "route_c") {
+                    solved = nricp::solve_route_c(
+                        prepared.normalized_template, prepared.normalized_target,
+                        prepared.graph, prepared.settings, mask_pointer,
+                        prepared.landmarks);
+                } else {
+                    solved = nricp::solve_route_b(
+                        prepared.normalized_template, prepared.normalized_target,
+                        prepared.graph, prepared.settings, mask_pointer,
+                        prepared.landmarks);
                 }
                 return route_result_to_dict(solved, prepared.graph);
             },
@@ -1480,15 +1487,19 @@ PYBIND11_MODULE(nricp_dp, m) {
         "the caller's units and converted into the solver's normalized frame "
         "internally; the caller hands in the template and target already aligned "
         "to each other.";
-    route_arguments(m, "solve_route_a", route_doc, /*use_device=*/false);
-    route_arguments(m, "solve_route_b", route_doc, /*use_device=*/true);
+    route_arguments(m, "solve_route_a", route_doc, "route_a");
+    route_arguments(m, "solve_route_b", route_doc, "route_b");
+    route_arguments(m, "solve_route_c", route_doc, "route_c");
 
     const char* session_doc =
-        "The route B schedule with the caller holding the loop: construct the "
+        "The device schedule with the caller holding the loop: construct the "
         "session, then call step() until finished(). Between steps the current "
         "shape is available through vertices(), so a host that draws the "
         "template can redraw as the fit progresses and stop early instead of "
-        "waiting for a result that no longer makes sense.";
+        "waiting for a result that no longer makes sense. `route` selects which "
+        "device route the session runs -- 'route_b' (the default, one damped "
+        "Gauss-Newton step over all six values per node) or 'route_c' (the "
+        "global/local alternation) -- and both report the same things.";
 
     // The same schedule with the caller holding the loop. This is the shape
     // qmyidp's cloth solver exposes (initialize, then step until satisfied), and
@@ -1511,7 +1522,13 @@ PYBIND11_MODULE(nricp_dp, m) {
                          double damping_decrease, double damping_increase,
                          int max_damping_attempts, bool diagonal_damping,
                          int graph_levels, int nodes_initial, int growth,
-                         double pcg_tolerance, int pcg_max_iterations) {
+                         double pcg_tolerance, int pcg_max_iterations,
+                         const std::string& route) {
+                if (route != "route_b" && route != "route_c") {
+                    throw std::invalid_argument(
+                        "the device session runs 'route_b' or 'route_c', not '" +
+                        route + "'");
+                }
                 PreparedSolve prepared = prepare_solve(
                     template_points, template_faces, target_points, target_faces,
                     level_settings, mask, landmark_indices, landmark_targets,
@@ -1525,7 +1542,9 @@ PYBIND11_MODULE(nricp_dp, m) {
                 return nricp::RouteBSession(
                     prepared.normalized_template, prepared.normalized_target,
                     prepared.graph, prepared.settings, mask_pointer,
-                    prepared.landmarks);
+                    prepared.landmarks,
+                    route == "route_c" ? nricp::DeviceRoute::LocalGlobal
+                                       : nricp::DeviceRoute::GaussNewton);
             }),
             py::arg("template_points"), py::arg("template_faces"),
             py::arg("target_points"), py::arg("target_faces"),
@@ -1538,7 +1557,8 @@ PYBIND11_MODULE(nricp_dp, m) {
             py::arg("damping_increase") = 4.0, py::arg("max_damping_attempts") = 6,
             py::arg("diagonal_damping") = true, py::arg("graph_levels") = 4,
             py::arg("nodes_initial") = 100, py::arg("growth") = 2,
-            py::arg("pcg_tolerance") = 1e-5, py::arg("pcg_max_iterations") = 60)
+            py::arg("pcg_tolerance") = 1e-5, py::arg("pcg_max_iterations") = 60,
+            py::arg("route") = "route_b")
         .def(
             "step",
             [](nricp::RouteBSession& session) {

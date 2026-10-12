@@ -29,6 +29,14 @@ struct GpuLevel {
     thrust::device_vector<int> gather_cursor;
     thrust::device_vector<int> gather_counts;
     thrust::device_vector<int> gather_vertex;
+    // The smoothness edges that touch each node. Route B's assembly walks the
+    // edges once, one thread per edge; route C's local step and its right-hand
+    // side both need each node's own influences, and having them in a list is
+    // what keeps those two passes atomic-free.
+    thrust::device_vector<int> node_edge_begin;
+    thrust::device_vector<int> node_edge_cursor;
+    thrust::device_vector<int> node_edge_counts;
+    thrust::device_vector<int> node_edge_list;
     // The node pairs that share a bound vertex. A vertex bound to several nodes
     // puts a cross block between every pair of those nodes into the system, and
     // one entry per (vertex, slot pair) with the same node pair is one group.

@@ -38,7 +38,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--method",
         default="route_a",
-        choices=("route_a", "route_b"),
+        choices=("route_a", "route_b", "route_c"),
         help="which native route to run (route_b is the accelerated one)",
     )
     parser.add_argument(

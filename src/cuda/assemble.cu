@@ -458,7 +458,10 @@ static __global__ void accumulate_anchor_kernel(
             jacobian[row][column] = scale * rotation_jacobian.m[row * 3 + column];
         }
     }
-    for (int row = 0; row < 6; ++row) {
+    // The translation rows of the anchor's Jacobian, which are scale * I. The
+    // bound is 3 and not 6: `row + 3` indexes a 6x6, so six iterations would
+    // write four rows past the end of the array.
+    for (int row = 0; row < 3; ++row) {
         jacobian[row + 3][row + 3] = scale;
     }
     float* block = &diag_blocks[node].m[0];

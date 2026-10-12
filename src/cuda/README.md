@@ -8,11 +8,19 @@ each, so the file to open is the file for the question being asked.
   launch constants, the block reduction, the vector accessors, and the row a
   linear functional of a node transform contributes.
 - `gpu_solver.cuh`, `gpu_solver.cu` — route B's surface: `solve_route_b` (the
-  batch entry point), `RouteBSession` (initialize, then one `step()` per
-  iteration, for a caller that wants to watch the fit and stop early), and the
-  device queries.
-- `session.cu` — the schedule both entry points share: the coarse-to-fine loop,
-  the correspondence updates, and the accept/reject test on the damping.
+  batch entry point), `solve_route_c` (the same thing solved by the global/local
+  alternation), `RouteBSession` (initialize, then one `step()` per iteration,
+  for a caller that wants to watch the fit and stop early; its `route` argument
+  selects which of the two device routes it runs), and the device queries.
+- `session.cu` — the schedule both routes share: the coarse-to-fine loop, the
+  correspondence updates, and the accept/reject test on the damping. The two
+  routes differ only where they have to, in one inner step and in which system
+  is assembled once per correspondence update.
+- `local_global.cuh`, `local_global.cu` — route C's two steps: the closed-form
+  rotation fit (Horn's quaternion method, one block per node walking its own
+  influences) and the translation-only global step, whose matrix is route B's
+  assembly restricted to its translation corner and is therefore assembled once
+  per correspondence update while only the right-hand side follows the fit.
 - `gpu_level.cuh`, `gpu_level.cu` — `GpuLevel`, everything one level needs on the
   device, sized once for the whole run and reused by every level and every step.
 - `level_layout.cuh`, `level_layout.cu` — the level's indexing: the node ->

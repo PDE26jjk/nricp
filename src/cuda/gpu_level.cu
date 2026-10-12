@@ -20,6 +20,12 @@ void reserve_level(GpuLevel& state, int max_nodes, int max_edges, int vertex_cou
     state.gather_cursor = thrust::device_vector<int>(max_nodes);
     state.gather_counts = thrust::device_vector<int>(max_nodes);
     state.gather_vertex = thrust::device_vector<int>(vertex_count * 4);
+    // An edge has two endpoints, so this is the most entries any level can
+    // produce.
+    state.node_edge_begin = thrust::device_vector<int>(max_nodes + 1);
+    state.node_edge_cursor = thrust::device_vector<int>(max_nodes);
+    state.node_edge_counts = thrust::device_vector<int>(max_nodes);
+    state.node_edge_list = thrust::device_vector<int>(max_edges * 2);
     // A vertex has at most six slot pairs, so this is the most entries any level
     // can emit and the most groups it can produce.
     const std::size_t pair_capacity = static_cast<std::size_t>(vertex_count) * 6;

@@ -17,6 +17,7 @@
 #include "cuda/host_staging.cuh"
 #include "cuda/lbvh.cuh"
 #include "cuda/level_layout.cuh"
+#include "cuda/local_global.cuh"
 #include "cuda/pcg_solver.cuh"
 #include "cuda/solver_common.cuh"
 #include "solver/route_shared.h"
@@ -44,10 +45,19 @@
 //
 // What stays host-side is the schedule: which energy is lower, whether a level
 // has converged, which damping to try next.
+//
+// The same schedule drives both device routes: the constructor's `route`
+// argument decides whether an inner step is one simultaneous Gauss-Newton step
+// over all six values per node (route B) or the global/local alternation
+// (route C). Everything else -- the levels, the correspondences, the robust
+// weights, the damping schedule, the reports -- is shared, so the two routes
+// differ only where they have to.
 namespace nricp {
 
 using gpu::apply_increment;
 using gpu::assemble_system;
+using gpu::assemble_translation_matrix;
+using gpu::assemble_translation_rhs;
 using gpu::AssembleInputs;
 using gpu::build_query_normals;
 using gpu::cooperative_block_count;
@@ -56,6 +66,7 @@ using gpu::download_state;
 using gpu::download_vectors;
 using gpu::EnergyReadout;
 using gpu::evaluate_deformation;
+using gpu::fit_rotations;
 using gpu::GpuLevel;
 using gpu::kEnergyKinds;
 using gpu::Lbvh;
@@ -104,6 +115,7 @@ struct RouteBSession::State {
     thrust::device_vector<float> landmark_target;
     GpuLevel level;  // reserved at the finest level's size and reused
 
+    DeviceRoute route = DeviceRoute::GaussNewton;
     cudaStream_t stream = nullptr;
     int vertex_count = 0;
     int triangle_count = 0;
@@ -140,6 +152,7 @@ struct RouteBSession::State {
         return level_settings_for(settings, level_index);
     }
 
+    AssembleInputs assemble_inputs(const LevelSettings& settings_for_level) const;
     EnergyReadout accumulate(const LevelSettings& settings_for_level,
                              bool with_jacobians);
     CorrespondenceCounts summarize();
@@ -154,11 +167,11 @@ struct RouteBSession::State {
     std::vector<Vec3> fitted_vertices();
 };
 
-// One accumulation pass: the level's blocks and right-hand side, and the five
-// block energies. Everything the pass needs that is not the level itself goes
-// in one request, so the schedule reads as the decision it is making.
-EnergyReadout RouteBSession::State::accumulate(
-    const LevelSettings& settings_for_level, bool with_jacobians) {
+// Everything one accumulation pass needs that is not the level itself, in one
+// request: the template's rest vertices and the landmark data belong to the
+// session rather than to the level, because they are the same for every level.
+AssembleInputs RouteBSession::State::assemble_inputs(
+    const LevelSettings& settings_for_level) const {
     AssembleInputs inputs;
     inputs.template_points = thrust::raw_pointer_cast(points.data());
     inputs.mask = mask_pointer;
@@ -176,7 +189,15 @@ EnergyReadout RouteBSession::State::accumulate(
     inputs.landmark = static_cast<float>(settings_for_level.weights.landmark);
     inputs.smoothness = static_cast<float>(settings_for_level.weights.smoothness);
     inputs.anchor = static_cast<float>(settings_for_level.weights.anchor);
-    return assemble_system(level, inputs, with_jacobians, staging, stream);
+    return inputs;
+}
+
+// One accumulation pass: the level's blocks and right-hand side, and the five
+// block energies.
+EnergyReadout RouteBSession::State::accumulate(
+    const LevelSettings& settings_for_level, bool with_jacobians) {
+    return assemble_system(level, assemble_inputs(settings_for_level),
+                           with_jacobians, staging, stream);
 }
 
 // The correspondence statistics for the level, reduced on the device.
@@ -235,7 +256,17 @@ void RouteBSession::State::refresh() {
                           static_cast<float>(settings_for_level.robust_threshold),
                           stream);
 
-    current_energy = accumulate(settings_for_level, true).total;
+    if (route == DeviceRoute::GaussNewton) {
+        current_energy = accumulate(settings_for_level, true).total;
+    } else {
+        // Route C's global matrix does not depend on the rotations, so it is
+        // assembled once here, per correspondence update, and every inner
+        // iteration that follows rebuilds only the right-hand side.
+        current_energy =
+            assemble_translation_matrix(level, assemble_inputs(settings_for_level),
+                                        staging, stream)
+                .total;
+    }
     inner = 0;
     if (outer == 0) {
         view.energy_start = current_energy;
@@ -244,22 +275,28 @@ void RouteBSession::State::refresh() {
 
 // One damped Newton step: the solve, the step, the energy, and the decision.
 // Returns false when the inner loop for this correspondence set is over.
-// One damped Newton step: the solve, the step, the energy, and the decision.
-// Returns false when the inner loop for this correspondence set is over.
 bool RouteBSession::State::inner_step() {
     const LevelSettings settings_for_level = level_settings();
     const int attempt_limit = std::max(1, settings.max_damping_attempts);
     double candidate_energy = current_energy;
     bool accepted = false;
     for (int attempt = 0; attempt < attempt_limit && !accepted; ++attempt) {
+        // Keep the accepted state before anything moves. Route C's local step
+        // replaces the rotations as well as the translations, so a rejected
+        // attempt has to be able to put back both.
+        save_accepted_state(level, level.node_count, stream);
+        if (route != DeviceRoute::GaussNewton) {
+            const AssembleInputs inputs = assemble_inputs(settings_for_level);
+            fit_rotations(level, inputs, stream);
+            assemble_translation_rhs(level, inputs, stream);
+        }
         const PcgOutcome outcome = solve_system(static_cast<float>(damping));
         if (!outcome.ok) {
             damping *= settings.damping_increase;
             continue;
         }
-        // Keep the accepted state, step, measure, and only then decide: the whole
-        // sequence runs on the device.
-        save_accepted_state(level, level.node_count, stream);
+        // Step, measure, and only then decide: the whole sequence runs on the
+        // device.
         apply_increment(level, level.node_count, stream);
         candidate_energy = accumulate(settings_for_level, false).total;
         if (candidate_energy < current_energy) {
@@ -282,9 +319,12 @@ bool RouteBSession::State::inner_step() {
     if (improvement <= settings_for_level.inner_tolerance) {
         return false;
     }
-    // The accepted state is on the device; assemble the system for the next inner
-    // iteration from it.
-    current_energy = accumulate(settings_for_level, true).total;
+    // The accepted state is on the device. Route B has to reassemble its system
+    // from it; route C's matrix is still the one that belongs to this
+    // correspondence set, and its energy is the one just measured.
+    current_energy = route == DeviceRoute::GaussNewton
+                         ? accumulate(settings_for_level, true).total
+                         : candidate_energy;
     return true;
 }
 
@@ -354,10 +394,13 @@ RouteBSession::RouteBSession(
     const TemplateGraph& graph,
     const RouteSettings& settings,
     const VertexMask* mask,
-    const std::vector<Landmark>& landmarks)
+    const std::vector<Landmark>& landmarks,
+    DeviceRoute route)
     : state_(std::make_unique<State>()) {
     State& session = *state_;
-    session.report.route = "route_b";
+    session.route = route;
+    session.report.route =
+        route == DeviceRoute::GaussNewton ? "route_b" : "route_c";
     session.report.precision = "float";
     session.report.version = NRICP_VERSION_STRING;
     session.template_mesh = normalized_template;

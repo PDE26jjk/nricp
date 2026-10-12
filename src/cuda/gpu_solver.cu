@@ -23,6 +23,21 @@ RouteResult solve_route_b(
     return session.result();
 }
 
+// Route C is the same session with the other route: the schedule, the energies,
+// the correspondences and the reports are route B's, and only the inner step
+// differs.
+RouteResult solve_route_c(
+    const Mesh& normalized_template, const Mesh& normalized_target,
+    const TemplateGraph& graph, const RouteSettings& settings,
+    const VertexMask* mask, const std::vector<Landmark>& landmarks) {
+    RouteBSession session(normalized_template, normalized_target, graph, settings,
+                          mask, landmarks, DeviceRoute::LocalGlobal);
+    while (!session.finished()) {
+        session.step();
+    }
+    return session.result();
+}
+
 bool device_available() {
     int count = 0;
     return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;

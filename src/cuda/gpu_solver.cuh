@@ -13,6 +13,18 @@
 
 namespace nricp {
 
+// The two routes the device path runs. They share the schedule, the energy, the
+// correspondence rules, the reports and the linear solver; they differ in how a
+// node's six values are obtained, and that is all.
+enum class DeviceRoute {
+    // Damped Gauss-Newton: one linearized step for each node's rotation and
+    // translation together, with the 6x6 blocks of the reduced system.
+    GaussNewton,
+    // Global/local: every rotation is replaced by a closed-form fit, and the
+    // solve that follows is translation-only.
+    LocalGlobal,
+};
+
 // Route B: the same energy, correspondence rules and coarse-to-fine schedule as
 // route A, with the device doing everything that is not a decision -- the
 // closest-point hierarchy, deformation evaluation, the deformed template's
@@ -20,6 +32,20 @@ namespace nricp {
 // solve that runs as one cooperative kernel. The host keeps only the schedule:
 // which level, which weights, damping, acceptance.
 RouteResult solve_route_b(
+    const Mesh& normalized_template,
+    const Mesh& normalized_target,
+    const TemplateGraph& graph,
+    const RouteSettings& settings,
+    const VertexMask* mask,
+    const std::vector<Landmark>& landmarks);
+
+// Route C: the same schedule, correspondence rules and energies, solved by the
+// global/local alternation instead of a simultaneous Newton step. The rotations
+// are fitted in closed form per node (Horn's quaternion method) and the linear
+// solve that follows is translation-only, which is what makes its matrix
+// independent of the rotations and therefore assembled once per correspondence
+// update rather than once per solve.
+RouteResult solve_route_c(
     const Mesh& normalized_template,
     const Mesh& normalized_target,
     const TemplateGraph& graph,
@@ -51,6 +77,12 @@ struct WrapProgress {
 // Everything the schedule needs on the device is allocated once, in the
 // constructor, at the finest level's size, and reused by every level and every
 // step, so driving the schedule from a loop does not reallocate.
+//
+// The class is named for the route it was written for and takes the route as an
+// argument now that there are two: `DeviceRoute::GaussNewton` is route B,
+// `DeviceRoute::LocalGlobal` is route C. Both run the same schedule and report
+// the same things, so a caller that drives the loop by hand -- which is the
+// point of the class -- does not care which one it constructed.
 class RouteBSession {
 public:
     RouteBSession(
@@ -59,7 +91,8 @@ public:
         const TemplateGraph& graph,
         const RouteSettings& settings,
         const VertexMask* mask,
-        const std::vector<Landmark>& landmarks);
+        const std::vector<Landmark>& landmarks,
+        DeviceRoute route = DeviceRoute::GaussNewton);
     ~RouteBSession();
     RouteBSession(RouteBSession&&) noexcept;
     RouteBSession& operator=(RouteBSession&&) noexcept;

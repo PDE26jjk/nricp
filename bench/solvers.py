@@ -76,7 +76,7 @@ def solve_module(
     """
     if module is None:
         raise ValueError("solve_module needs the extension module")
-    if method not in ("route_a", "route_b", "rigid"):
+    if method not in ("route_a", "route_b", "route_c", "rigid"):
         raise ValueError(f"unsupported native method: {method!r}")
     if method == "rigid":
         return case.aligned_template_vertices.copy()

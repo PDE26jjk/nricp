@@ -62,6 +62,39 @@ static __global__ void scatter_bound_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// The node -> incident-edge lists
+// ---------------------------------------------------------------------------
+//
+// Both routes walk the edges once per pass, but route C's local step and its
+// right-hand side need each node's own influences: the fit for node j sums only
+// the terms that mention j, and the right-hand side is assembled per node. A
+// CSR over the edges is what lets both of those passes own their data instead
+// of firing atomics at a shared block.
+
+static __global__ void count_node_edges_kernel(
+    const int* __restrict__ edge_nodes, int edge_count, int* __restrict__ counts) {
+    const int edge = blockIdx.x * blockDim.x + threadIdx.x;
+    if (edge >= edge_count) {
+        return;
+    }
+    atomicAdd(&counts[edge_nodes[edge * 2 + 0]], 1);
+    atomicAdd(&counts[edge_nodes[edge * 2 + 1]], 1);
+}
+
+static __global__ void scatter_node_edges_kernel(
+    const int* __restrict__ edge_nodes, int edge_count, int* __restrict__ cursor,
+    int* __restrict__ out) {
+    const int edge = blockIdx.x * blockDim.x + threadIdx.x;
+    if (edge >= edge_count) {
+        return;
+    }
+    const int node_a = edge_nodes[edge * 2 + 0];
+    const int node_b = edge_nodes[edge * 2 + 1];
+    out[atomicAdd(&cursor[node_a], 1)] = edge;
+    out[atomicAdd(&cursor[node_b], 1)] = edge;
+}
+
+// ---------------------------------------------------------------------------
 // The node-pair structure
 //
 // A vertex bound to several nodes contributes a cross block J_a^T J_b between
@@ -243,6 +276,32 @@ void load_level(GpuLevel& state, const GraphLevel& level, int vertex_count,
         thrust::raw_pointer_cast(state.binding_weights.data()), vertex_count,
         thrust::raw_pointer_cast(state.gather_cursor.data()),
         thrust::raw_pointer_cast(state.gather_vertex.data()));
+    throw_on_cuda_error(cudaGetLastError());
+
+    // ---- the node -> incident-edge lists ----
+    // The same two passes as the vertex lists above, over the graph's edges
+    // instead of the vertices. Only the smoothness edges are listed: the
+    // node-pair groups appended to the edge list later are a device-side
+    // artifact of the assembly, not part of the graph.
+    const int* edge_nodes = thrust::raw_pointer_cast(state.edges.data());
+    thrust::fill(par, state.node_edge_counts.begin(),
+                 state.node_edge_counts.begin() + state.node_count, 0);
+    count_node_edges_kernel<<<blocks_for(state.edge_count), kThreads, 0, stream>>>(
+        edge_nodes, state.edge_count,
+        thrust::raw_pointer_cast(state.node_edge_counts.data()));
+    throw_on_cuda_error(cudaGetLastError());
+    thrust::fill(par, state.node_edge_begin.begin(),
+                 state.node_edge_begin.begin() + 1, 0);
+    thrust::inclusive_scan(par, state.node_edge_counts.begin(),
+                           state.node_edge_counts.begin() + state.node_count,
+                           state.node_edge_begin.begin() + 1);
+    thrust::copy(par, state.node_edge_begin.begin(),
+                 state.node_edge_begin.begin() + state.node_count,
+                 state.node_edge_cursor.begin());
+    scatter_node_edges_kernel<<<blocks_for(state.edge_count), kThreads, 0, stream>>>(
+        edge_nodes, state.edge_count,
+        thrust::raw_pointer_cast(state.node_edge_cursor.data()),
+        thrust::raw_pointer_cast(state.node_edge_list.data()));
     throw_on_cuda_error(cudaGetLastError());
 
     // ---- the node-pair groups ----

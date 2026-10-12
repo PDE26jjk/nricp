@@ -2,9 +2,9 @@
 # (gpu_solver.cu), the schedule (session.cu), the device-side vocabulary
 # (solver_common.cuh), the level's buffers (gpu_level), the level's indexing
 # (level_layout), the assembly (assemble), the deformation kernels (deform_ops),
-# the linear solve (pcg_solver), the host/device boundary (host_staging), the
-# target's acceleration structure (lbvh) and the template graph builder
-# (graph_build).
+# the linear solve (pcg_solver), route C's two steps (local_global), the
+# host/device boundary (host_staging), the target's acceleration structure
+# (lbvh) and the template graph builder (graph_build).
 #
 # No __device__ function crosses a translation unit: the shared ones are inline
 # in the headers, so each unit that needs them compiles its own copy, and every
@@ -34,6 +34,8 @@ target_sources(nricp_cuda PRIVATE
     lbvh.cuh
     level_layout.cu
     level_layout.cuh
+    local_global.cu
+    local_global.cuh
     pcg_solver.cu
     pcg_solver.cuh
     session.cu
