@@ -4,6 +4,7 @@
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 #include <thrust/fill.h>
+#include <thrust/scan.h>
 #include <thrust/sort.h>
 #include <thrust/system/cuda/execution_policy.h>
 
@@ -60,7 +61,17 @@ constexpr int kEnergyKinds = 5;  // point-to-point, plane, smoothness, anchor, l
 constexpr int kRejectionKinds = 5;
 constexpr int kReduceBlocks = 32;  // blocks that contribute a partial sum
 
+// One block owns one node's block in the gathered accumulation, so this is the
+// block's own thread count rather than the project-wide one.
+constexpr int kGatherThreads = 128;
+
+// Six values per node, so the gathered kernel reduces this many numbers per
+// thread at the end of its sweep.
+constexpr int kBlockValues = 36;
+
 int blocks_for(int count) { return (count + kThreads - 1) / kThreads; }
+
+int gather_blocks_for(int count) { return (count + kGatherThreads - 1) / kGatherThreads; }
 
 __device__ inline Vec3f load_vec3(const float* data, int index) {
     return {data[index * 3 + 0], data[index * 3 + 1], data[index * 3 + 2]};
@@ -323,106 +334,306 @@ __device__ inline Vec3f node_rotated_offset(const Mat3f* rotations,
     return rotations[node] * (point - load_vec3(node_rest, node));
 }
 
-static __global__ void accumulate_data_kernel(
+// ---------------------------------------------------------------------------
+// The gathered accumulation
+//
+// The data term used to run the other way round: every vertex scattered its
+// 6x6 block into whichever nodes it touched, so a node's block was written by
+// hundreds of threads at once and every write was an atomic into L2. ncu caught
+// exactly that -- the kernel sat at 1.6% of the machine with `lg_throttle`
+// dominating the stalls, because a hundred thousand vertices were funnelling
+// their blocks through a few hundred nodes' worth of addresses.
+//
+// It now runs the way the data lies: one block owns one node, walks that node's
+// bound vertices, and keeps its 6x6 block and 6-vector right-hand side in
+// registers. The only write is the block's own result, so there is no atomic in
+// the pass at all, and the block's contribution to a node is computed by the
+// thread that will store it.
+//
+// The cost is that a vertex is visited once per node it binds to -- three times,
+// typically, since the binding formula zeroes the farthest of its four slots --
+// and its deformation and Jacobians are recomputed each time. That is vector
+// arithmetic; the atomics it replaces were not.
+// ---------------------------------------------------------------------------
+
+// One thread's share of a node's block plus one row of the vertex's residuals.
+// `jacobians` is compacted to the slots that belong to this node, which is
+// normally one of them; the pair loop is what makes a vertex bound to the same
+// node twice come out right.
+__device__ inline void gather_row(float* block, float* right, int slots,
+                                  const float* jacobians, float value) {
+    for (int a = 0; a < slots; ++a) {
+        const float* ja = jacobians + a * 6;
+        for (int column = 0; column < 6; ++column) {
+            right[column] -= ja[column] * value;
+        }
+        for (int b = 0; b < slots; ++b) {
+            const float* jb = jacobians + b * 6;
+            for (int row = 0; row < 6; ++row) {
+                const float lhs = ja[row];
+                for (int column = 0; column < 6; ++column) {
+                    block[row * 6 + column] += lhs * jb[column];
+                }
+            }
+        }
+    }
+}
+
+// The node -> bound-vertex lists the gather walks. Built once per level, so the
+// counting pass is the only atomic left on this path and it does not run per
+// iteration. A vertex lands in the list of every node it binds to with a
+// non-zero weight, which is what makes the gather cover the same rows the
+// scatter did.
+static __global__ void count_bound_kernel(
+    const int* __restrict__ binding_nodes, const int* __restrict__ binding_counts,
+    const float* __restrict__ binding_weights, int vertex_count,
+    int* __restrict__ counts) {
+    const int vertex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vertex >= vertex_count) {
+        return;
+    }
+    const int count = binding_counts[vertex];
+    for (int slot = 0; slot < count; ++slot) {
+        const int node = binding_nodes[vertex * 4 + slot];
+        if (node < 0 || binding_weights[vertex * 4 + slot] == 0.0f) {
+            continue;
+        }
+        atomicAdd(&counts[node], 1);
+    }
+}
+
+static __global__ void scatter_bound_kernel(
+    const int* __restrict__ binding_nodes, const int* __restrict__ binding_counts,
+    const float* __restrict__ binding_weights, int vertex_count,
+    int* __restrict__ cursor, int* __restrict__ out) {
+    const int vertex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vertex >= vertex_count) {
+        return;
+    }
+    const int count = binding_counts[vertex];
+    for (int slot = 0; slot < count; ++slot) {
+        const int node = binding_nodes[vertex * 4 + slot];
+        if (node < 0 || binding_weights[vertex * 4 + slot] == 0.0f) {
+            continue;
+        }
+        out[atomicAdd(&cursor[node], 1)] = vertex;
+    }
+}
+
+static __global__ void assemble_node_kernel(
+    const float* points, const float* node_rest, const int* binding_nodes,
+    const float* binding_weights, const int* binding_counts, const Mat3f* rotations,
+    const float* translations, const float* correspondence_points,
+    const float* correspondence_normals, const unsigned char* rejection,
+    const float* robust_weights, const unsigned char* mask, const int* gather_begin,
+    const int* gather_vertex, const float* landmark_flag,
+    const float* landmark_targets, float point_weight, float plane_weight,
+    float landmark_weight, int node_count, Mat6f* diag_blocks, float* rhs) {
+    const int node = blockIdx.x;
+    if (node >= node_count) {
+        return;
+    }
+    float block[kBlockValues];
+    float right[6];
+    for (int i = 0; i < kBlockValues; ++i) {
+        block[i] = 0.0f;
+    }
+    for (int i = 0; i < 6; ++i) {
+        right[i] = 0.0f;
+    }
+
+    const int begin = gather_begin[node];
+    const int end = gather_begin[node + 1];
+    for (int index = begin + threadIdx.x; index < end; index += blockDim.x) {
+        const int vertex = gather_vertex[index];
+        // The mask and the correspondence filters silence the *data* rows of a
+        // vertex; a landmark marker on the same vertex is a separate constraint
+        // and keeps its rows, which is what the separate landmark block did.
+        const bool carry_data =
+            rejection[vertex] == 0 && (mask == nullptr || mask[vertex] != 0);
+        const Vec3f point = load_vec3(points, vertex);
+        const int count = binding_counts[vertex];
+        const float robust = robust_weights[vertex];
+
+        // The vertex's slots, and which of them land on this node.
+        Vec3f rotated[4];
+        float weights[4];
+        int own[4];
+        int slots = 0;
+        int own_count = 0;
+        Vec3f deformed;
+        for (int slot = 0; slot < count; ++slot) {
+            const int other = binding_nodes[vertex * 4 + slot];
+            const float weight = binding_weights[vertex * 4 + slot];
+            if (other < 0 || weight == 0.0f) {
+                continue;
+            }
+            const Vec3f rest = load_vec3(node_rest, other);
+            deformed += (rotations[other] * (point - rest) + rest +
+                         load_vec3(translations, other)) *
+                        weight;
+            rotated[slots] = node_rotated_offset(rotations, node_rest, other, point);
+            weights[slots] = weight;
+            if (other == node) {
+                own[own_count++] = slots;
+            }
+            ++slots;
+        }
+        if (own_count == 0) {
+            continue;
+        }
+        float jacobians[4][6];
+        const Vec3f offset = deformed - load_vec3(correspondence_points, vertex);
+        const Vec3f normal = load_vec3(correspondence_normals, vertex);
+
+        if (carry_data && point_weight > 0.0f) {
+            const float scale = sqrtf(point_weight * robust);
+            for (int row = 0; row < 3; ++row) {
+                const Vec3f axis = row == 0   ? Vec3f{1.0f, 0.0f, 0.0f}
+                                   : row == 1 ? Vec3f{0.0f, 1.0f, 0.0f}
+                                              : Vec3f{0.0f, 0.0f, 1.0f};
+                for (int s = 0; s < own_count; ++s) {
+                    fill_linear_row(axis, rotated[own[s]],
+                                    scale * weights[own[s]], jacobians[s]);
+                }
+                const float value =
+                    row == 0 ? offset.x : (row == 1 ? offset.y : offset.z);
+                gather_row(block, right, own_count, &jacobians[0][0], scale * value);
+            }
+        }
+        if (carry_data && plane_weight > 0.0f) {
+            const float scale = sqrtf(plane_weight * robust);
+            for (int s = 0; s < own_count; ++s) {
+                fill_linear_row(normal, rotated[own[s]], scale * weights[own[s]],
+                                jacobians[s]);
+            }
+            gather_row(block, right, own_count, &jacobians[0][0],
+                       scale * dot(normal, offset));
+        }
+
+        // A landmark vertex carries an extra set of rows onto its own target,
+        // with the level's landmark weight rather than the data weight.
+        const float landmark =
+            (landmark_flag == nullptr || landmark_flag[vertex] == 0.0f)
+                ? 0.0f
+                : landmark_weight;
+        if (landmark > 0.0f) {
+            const float scale = sqrtf(landmark);
+            const Vec3f to_marker =
+                deformed - load_vec3(landmark_targets, vertex);
+            for (int row = 0; row < 3; ++row) {
+                const Vec3f axis = row == 0   ? Vec3f{1.0f, 0.0f, 0.0f}
+                                   : row == 1 ? Vec3f{0.0f, 1.0f, 0.0f}
+                                              : Vec3f{0.0f, 0.0f, 1.0f};
+                for (int s = 0; s < own_count; ++s) {
+                    fill_linear_row(axis, rotated[own[s]],
+                                    scale * weights[own[s]], jacobians[s]);
+                }
+                const float value = row == 0   ? to_marker.x
+                                    : row == 1 ? to_marker.y
+                                               : to_marker.z;
+                gather_row(block, right, own_count, &jacobians[0][0], scale * value);
+            }
+        }
+    }
+
+    // One pad word per thread so the reduction's stride is odd, which keeps its
+    // shared accesses off the same bank.
+    __shared__ float staged[kGatherThreads][kBlockValues + 1];
+    __shared__ float staged_right[kGatherThreads][7];
+    for (int i = 0; i < kBlockValues; ++i) {
+        staged[threadIdx.x][i] = block[i];
+    }
+    for (int i = 0; i < 6; ++i) {
+        staged_right[threadIdx.x][i] = right[i];
+    }
+    __syncthreads();
+    for (int span = blockDim.x / 2; span > 0; span >>= 1) {
+        if (threadIdx.x < span) {
+            for (int i = 0; i < kBlockValues; ++i) {
+                staged[threadIdx.x][i] += staged[threadIdx.x + span][i];
+            }
+            for (int i = 0; i < 6; ++i) {
+                staged_right[threadIdx.x][i] += staged_right[threadIdx.x + span][i];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < kBlockValues; ++i) {
+            diag_blocks[node].m[i] = staged[0][i];
+        }
+        for (int i = 0; i < 6; ++i) {
+            rhs[node * 6 + i] = staged_right[0][i];
+        }
+    }
+}
+
+
+// The data term's energies, one pass over the vertices. The right-hand side and
+// the blocks are not built here any more: the gathered pass owns them, and this
+// kernel's job is only the two numbers the accept/reject test and the level's
+// convergence test look at.
+//
+// Those numbers used to be two `atomicAdd`s per vertex into two single
+// addresses, which is a hundred thousand serialized updates per pass and showed
+// up as one of the two most expensive kernels at 100k. They are reduced across
+// the block first and added once per block instead, which is where the 250x
+// drop in those atomics comes from. The early exits the earlier version had are
+// gone with it, because every thread has to reach the block reduction.
+static __global__ void energy_data_kernel(
     const float* points, const float* node_rest, const int* binding_nodes,
     const float* binding_weights, const int* binding_counts, const Mat3f* rotations,
     const float* translations, const float* correspondence_points,
     const float* correspondence_normals, const unsigned char* rejection,
     const float* robust_weights, const unsigned char* mask, int vertex_count,
-    float plane_weight, float point_weight, bool with_jacobians, Mat6f* diag_blocks,
-    float* rhs, float* energies) {
+    float plane_weight, float point_weight, float* energies) {
     const int vertex = blockIdx.x * blockDim.x + threadIdx.x;
-    if (vertex >= vertex_count || rejection[vertex] != 0) {
-        return;
-    }
-    if (mask != nullptr && mask[vertex] == 0) {
-        return;
-    }
-    const Vec3f point = load_vec3(points, vertex);
-    const Vec3f target = load_vec3(correspondence_points, vertex);
-    const int count = binding_counts[vertex];
-    Vec3f deformed;
-    for (int slot = 0; slot < count; ++slot) {
-        const int node = binding_nodes[vertex * 4 + slot];
-        const float weight = binding_weights[vertex * 4 + slot];
-        if (weight == 0.0f || node < 0) {
-            continue;
-        }
-        const Vec3f rest = load_vec3(node_rest, node);
-        deformed +=
-            (rotations[node] * (point - rest) + rest +
-             load_vec3(translations, node)) *
-            weight;
-    }
-    const Vec3f offset = deformed - target;
-    const Vec3f normal = load_vec3(correspondence_normals, vertex);
-    const float robust = robust_weights[vertex];
-
-    // Point-to-point rows.
-    if (point_weight > 0.0f) {
-        const float scale = sqrtf(point_weight * robust);
-        const Vec3f scaled = offset * scale;
-        atomicAdd(&energies[0], squared_norm(scaled));
-        if (with_jacobians) {
-            const Vec3f axes[3] = {{1.0f, 0.0f, 0.0f},
-                                   {0.0f, 1.0f, 0.0f},
-                                   {0.0f, 0.0f, 1.0f}};
-            for (int row = 0; row < 3; ++row) {
-                const float value =
-                    row == 0 ? scaled.x : (row == 1 ? scaled.y : scaled.z);
-                for (int slot = 0; slot < count; ++slot) {
-                    const int node = binding_nodes[vertex * 4 + slot];
-                    const float weight = binding_weights[vertex * 4 + slot];
-                    if (weight == 0.0f || node < 0) {
-                        continue;
-                    }
-                    float jacobian[6];
-                    fill_linear_row(
-                        axes[row],
-                        node_rotated_offset(rotations, node_rest, node, point),
-                        scale * weight, jacobian);
-                    for (int column = 0; column < 6; ++column) {
-                        atomicAdd(&rhs[node * 6 + column], -jacobian[column] * value);
-                    }
-                    float* block = &diag_blocks[node].m[0];
-                    for (int a = 0; a < 6; ++a) {
-                        for (int b = 0; b < 6; ++b) {
-                            atomicAdd(&block[a * 6 + b], jacobian[a] * jacobian[b]);
-                        }
-                    }
-                }
+    float point_energy = 0.0f;
+    float plane_energy = 0.0f;
+    const bool active = vertex < vertex_count && rejection[vertex] == 0 &&
+                        (mask == nullptr || mask[vertex] != 0);
+    if (active) {
+        const Vec3f point = load_vec3(points, vertex);
+        const int count = binding_counts[vertex];
+        Vec3f deformed;
+        for (int slot = 0; slot < count; ++slot) {
+            const int node = binding_nodes[vertex * 4 + slot];
+            const float weight = binding_weights[vertex * 4 + slot];
+            if (weight == 0.0f || node < 0) {
+                continue;
             }
+            const Vec3f rest = load_vec3(node_rest, node);
+            deformed += (rotations[node] * (point - rest) + rest +
+                         load_vec3(translations, node)) *
+                        weight;
+        }
+        const float robust = robust_weights[vertex];
+        const Vec3f offset = deformed - load_vec3(correspondence_points, vertex);
+        if (point_weight > 0.0f) {
+            const Vec3f scaled = offset * sqrtf(point_weight * robust);
+            point_energy = squared_norm(scaled);
+        }
+        if (plane_weight > 0.0f) {
+            const Vec3f normal = load_vec3(correspondence_normals, vertex);
+            const float value = sqrtf(plane_weight * robust) * dot(normal, offset);
+            plane_energy = value * value;
         }
     }
-
-    // Point-to-plane row.
-    if (plane_weight > 0.0f) {
-        const float scale = sqrtf(plane_weight * robust);
-        const float value = scale * dot(normal, offset);
-        atomicAdd(&energies[1], value * value);
-        if (with_jacobians) {
-            for (int slot = 0; slot < count; ++slot) {
-                const int node = binding_nodes[vertex * 4 + slot];
-                const float weight = binding_weights[vertex * 4 + slot];
-                if (weight == 0.0f || node < 0) {
-                    continue;
-                }
-                float jacobian[6];
-                fill_linear_row(
-                    normal,
-                    node_rotated_offset(rotations, node_rest, node, point),
-                    scale * weight, jacobian);
-                for (int column = 0; column < 6; ++column) {
-                    atomicAdd(&rhs[node * 6 + column], -jacobian[column] * value);
-                }
-                float* block = &diag_blocks[node].m[0];
-                for (int a = 0; a < 6; ++a) {
-                    for (int b = 0; b < 6; ++b) {
-                        atomicAdd(&block[a * 6 + b], jacobian[a] * jacobian[b]);
-                    }
-                }
-            }
+    __shared__ float shared[2][kThreads];
+    shared[0][threadIdx.x] = point_energy;
+    shared[1][threadIdx.x] = plane_energy;
+    __syncthreads();
+    for (int span = blockDim.x / 2; span > 0; span >>= 1) {
+        if (threadIdx.x < span) {
+            shared[0][threadIdx.x] += shared[0][threadIdx.x + span];
+            shared[1][threadIdx.x] += shared[1][threadIdx.x + span];
         }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicAdd(&energies[0], shared[0][0]);
+        atomicAdd(&energies[1], shared[1][0]);
     }
 }
 
@@ -896,6 +1107,13 @@ struct GpuLevel {
     thrust::device_vector<float> binding_weights;
     thrust::device_vector<int> binding_counts;
     thrust::device_vector<int> edges;
+    // The node -> bound-vertex lists the gathered accumulation walks, plus the
+    // scratch the counting pass and the scatter need. Sized for every vertex
+    // binding all four of its slots, which is the most any level can produce.
+    thrust::device_vector<int> gather_begin;
+    thrust::device_vector<int> gather_cursor;
+    thrust::device_vector<int> gather_counts;
+    thrust::device_vector<int> gather_vertex;
     thrust::device_vector<Mat3f> rotations;
     thrust::device_vector<float> translations;
     thrust::device_vector<Mat3f> rotations_backup;
@@ -935,6 +1153,10 @@ void reserve_level(GpuLevel& state, int max_nodes, int max_edges, int vertex_cou
     state.binding_weights = thrust::device_vector<float>(vertex_count * 4);
     state.binding_counts = thrust::device_vector<int>(vertex_count);
     state.edges = thrust::device_vector<int>(max_edges * 2);
+    state.gather_begin = thrust::device_vector<int>(max_nodes + 1);
+    state.gather_cursor = thrust::device_vector<int>(max_nodes);
+    state.gather_counts = thrust::device_vector<int>(max_nodes);
+    state.gather_vertex = thrust::device_vector<int>(vertex_count * 4);
     state.rotations = thrust::device_vector<Mat3f>(max_nodes);
     state.translations = thrust::device_vector<float>(max_nodes * 3);
     state.rotations_backup = thrust::device_vector<Mat3f>(max_nodes);
@@ -962,9 +1184,13 @@ void reserve_level(GpuLevel& state, int max_nodes, int max_edges, int vertex_cou
     state.statistics = thrust::device_vector<float>(3);
 }
 
-// Loads one level's own data into the reserved buffers. Assigning a smaller
-// count than the buffer holds keeps the storage, so this never reallocates.
-void load_level(GpuLevel& state, const GraphLevel& level) {
+// Loads one level's own data into the reserved buffers and rebuilds the
+// node -> bound-vertex lists. Assigning a smaller count than the buffer holds
+// keeps the storage, so this never reallocates; the gather is per level because
+// the bindings are, and rebuilding it costs two passes over the vertices rather
+// than one per iteration.
+void load_level(GpuLevel& state, const GraphLevel& level, int vertex_count,
+                cudaStream_t stream) {
     state.node_count = level.node_count();
     state.edge_count = static_cast<int>(level.edges.size());
     std::vector<float> node_rest(level.node_rest_positions.size() * 3);
@@ -989,6 +1215,30 @@ void load_level(GpuLevel& state, const GraphLevel& level) {
         edge_list[edge * 2 + 1] = level.edges[edge].b;
     }
     state.edges.assign(edge_list.begin(), edge_list.end());
+
+    const auto par = thrust::cuda::par.on(stream);
+    thrust::fill(par, state.gather_counts.begin(),
+                 state.gather_counts.begin() + state.node_count, 0);
+    count_bound_kernel<<<blocks_for(vertex_count), kThreads, 0, stream>>>(
+        thrust::raw_pointer_cast(state.binding_nodes.data()),
+        thrust::raw_pointer_cast(state.binding_counts.data()),
+        thrust::raw_pointer_cast(state.binding_weights.data()), vertex_count,
+        thrust::raw_pointer_cast(state.gather_counts.data()));
+    throw_on_cuda_error(cudaGetLastError());
+    thrust::fill(par, state.gather_begin.begin(), state.gather_begin.begin() + 1, 0);
+    thrust::inclusive_scan(par, state.gather_counts.begin(),
+                           state.gather_counts.begin() + state.node_count,
+                           state.gather_begin.begin() + 1);
+    thrust::copy(par, state.gather_begin.begin(),
+                 state.gather_begin.begin() + state.node_count,
+                 state.gather_cursor.begin());
+    scatter_bound_kernel<<<blocks_for(vertex_count), kThreads, 0, stream>>>(
+        thrust::raw_pointer_cast(state.binding_nodes.data()),
+        thrust::raw_pointer_cast(state.binding_counts.data()),
+        thrust::raw_pointer_cast(state.binding_weights.data()), vertex_count,
+        thrust::raw_pointer_cast(state.gather_cursor.data()),
+        thrust::raw_pointer_cast(state.gather_vertex.data()));
+    throw_on_cuda_error(cudaGetLastError());
 }
 
 // A pinned staging buffer for the handful of scalars the schedule has to see.
@@ -1193,6 +1443,13 @@ struct RouteBSession::State {
     const unsigned char* mask_pointer = nullptr;
     thrust::device_vector<int> landmark_vertices;
     thrust::device_vector<float> landmark_targets;
+    // The landmark rows live inside the gathered pass, which walks vertices, so
+    // the markers are also indexed per vertex: a flag saying which vertices are
+    // markers at all, and the position each is asked to sit on. Both are fixed
+    // for the run; the weight itself comes from the level's schedule, since the
+    // per-level schedule anneals it.
+    thrust::device_vector<float> landmark_flag;
+    thrust::device_vector<float> landmark_target;
     GpuLevel level;  // reserved at the finest level's size and reused
 
     cudaStream_t stream = nullptr;
@@ -1250,9 +1507,32 @@ EnergyReadout RouteBSession::State::accumulate(
     const LevelSettings& settings_for_level, bool with_jacobians) {
     thrust::fill(par(), level.energies.begin(), level.energies.end(), 0.0f);
     if (with_jacobians) {
-        thrust::fill(par(), level.diagonal.begin(), level.diagonal.end(), Mat6f{});
-        thrust::fill(par(), level.rhs.begin(), level.rhs.end(), 0.0f);
+        // The gathered pass assigns every node's block and right-hand side
+        // outright, so neither needs clearing first; only the per-edge blocks do,
+        // because the smoothness kernel accumulates into the edge that owns them.
         thrust::fill(par(), level.edge_blocks.begin(), level.edge_blocks.end(), Mat6f{});
+        assemble_node_kernel<<<dim3(level.node_count), kGatherThreads, 0, stream>>>(
+            thrust::raw_pointer_cast(points.data()),
+            thrust::raw_pointer_cast(level.node_rest.data()),
+            thrust::raw_pointer_cast(level.binding_nodes.data()),
+            thrust::raw_pointer_cast(level.binding_weights.data()),
+            thrust::raw_pointer_cast(level.binding_counts.data()),
+            thrust::raw_pointer_cast(level.rotations.data()),
+            thrust::raw_pointer_cast(level.translations.data()),
+            thrust::raw_pointer_cast(level.correspondence_points.data()),
+            thrust::raw_pointer_cast(level.correspondence_normals.data()),
+            thrust::raw_pointer_cast(level.rejection.data()),
+            thrust::raw_pointer_cast(level.robust_weights.data()), mask_pointer,
+            thrust::raw_pointer_cast(level.gather_begin.data()),
+            thrust::raw_pointer_cast(level.gather_vertex.data()),
+            thrust::raw_pointer_cast(landmark_flag.data()),
+            thrust::raw_pointer_cast(landmark_target.data()),
+            static_cast<float>(settings_for_level.weights.point_to_point),
+            static_cast<float>(settings_for_level.weights.point_to_plane),
+            static_cast<float>(settings_for_level.weights.landmark),
+            level.node_count, thrust::raw_pointer_cast(level.diagonal.data()),
+            thrust::raw_pointer_cast(level.rhs.data()));
+        throw_on_cuda_error(cudaGetLastError());
     }
     accumulate_anchor_kernel<<<blocks_for(level.node_count), kThreads, 0, stream>>>(
         level.node_count, thrust::raw_pointer_cast(level.rotations.data()),
@@ -1278,7 +1558,7 @@ EnergyReadout RouteBSession::State::accumulate(
     }
     if (settings_for_level.weights.point_to_point > 0.0 ||
         settings_for_level.weights.point_to_plane > 0.0) {
-        accumulate_data_kernel<<<blocks_for(vertex_count), kThreads, 0, stream>>>(
+        energy_data_kernel<<<blocks_for(vertex_count), kThreads, 0, stream>>>(
             thrust::raw_pointer_cast(points.data()),
             thrust::raw_pointer_cast(level.node_rest.data()),
             thrust::raw_pointer_cast(level.binding_nodes.data()),
@@ -1293,8 +1573,6 @@ EnergyReadout RouteBSession::State::accumulate(
             vertex_count,
             static_cast<float>(settings_for_level.weights.point_to_plane),
             static_cast<float>(settings_for_level.weights.point_to_point),
-            with_jacobians, thrust::raw_pointer_cast(level.diagonal.data()),
-            thrust::raw_pointer_cast(level.rhs.data()),
             thrust::raw_pointer_cast(level.energies.data()));
         throw_on_cuda_error(cudaGetLastError());
     }
@@ -1309,7 +1587,7 @@ EnergyReadout RouteBSession::State::accumulate(
             thrust::raw_pointer_cast(level.translations.data()),
             thrust::raw_pointer_cast(landmark_vertices.data()),
             thrust::raw_pointer_cast(landmark_targets.data()), landmark_count,
-            static_cast<float>(settings_for_level.weights.landmark), with_jacobians,
+                static_cast<float>(settings_for_level.weights.landmark), false,
             thrust::raw_pointer_cast(level.diagonal.data()),
             thrust::raw_pointer_cast(level.rhs.data()),
             thrust::raw_pointer_cast(level.energies.data()));
@@ -1428,7 +1706,7 @@ void RouteBSession::State::begin_level() {
         deformation = transfer_to_level(graph.levels[level_index - 1], deformation,
                                         graph_level);
     }
-    load_level(level, graph_level);
+    load_level(level, graph_level, vertex_count, stream);
     upload_state(deformation, level.rotations, level.translations);
     view = LevelView{};
     view.level = static_cast<int>(level_index);
@@ -1686,6 +1964,25 @@ RouteBSession::RouteBSession(
     session.landmark_vertices = upload_ints(landmark_vertices);
     session.landmark_targets = upload_vectors(landmark_targets);
     session.landmark_count = static_cast<int>(landmark_vertices.size());
+    std::vector<float> landmark_weight(static_cast<std::size_t>(session.vertex_count),
+                                       0.0f);
+    std::vector<float> landmark_target(static_cast<std::size_t>(session.vertex_count) * 3,
+                                       0.0f);
+    for (std::size_t index = 0; index < landmark_vertices.size(); ++index) {
+        const int vertex = landmark_vertices[index];
+        if (vertex < 0 || vertex >= session.vertex_count) {
+            continue;
+        }
+        landmark_weight[static_cast<std::size_t>(vertex)] = 1.0f;
+        landmark_target[static_cast<std::size_t>(vertex) * 3 + 0] =
+            static_cast<float>(landmark_targets[index].x);
+        landmark_target[static_cast<std::size_t>(vertex) * 3 + 1] =
+            static_cast<float>(landmark_targets[index].y);
+        landmark_target[static_cast<std::size_t>(vertex) * 3 + 2] =
+            static_cast<float>(landmark_targets[index].z);
+    }
+    session.landmark_flag.assign(landmark_weight.begin(), landmark_weight.end());
+    session.landmark_target.assign(landmark_target.begin(), landmark_target.end());
 
     // Every buffer at the finest level's size: from here on a level only assigns
     // into storage that already exists, so neither a level change nor a step
