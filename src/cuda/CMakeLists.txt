@@ -10,6 +10,8 @@ add_library(nricp_cuda STATIC)
 target_sources(nricp_cuda PRIVATE
     cuda_error.h
     device_math.cuh
+    graph_build.cu
+    graph_build.cuh
     gpu_solver.cu
     gpu_solver.cuh
     lbvh.cu

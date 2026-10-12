@@ -19,6 +19,7 @@
 #include "core/constraints.h"
 #include "core/deformation.h"
 #include "core/graph.h"
+#include "cuda/graph_build.cuh"
 #include "core/mesh.h"
 #include "core/report.h"
 #include "core/version.h"
@@ -588,7 +589,8 @@ PreparedSolve prepare_solve(
     double distance_threshold, double min_normal_cosine, double min_slope,
     double initial_damping, double damping_decrease, double damping_increase,
     int max_damping_attempts, bool diagonal_damping, int graph_levels,
-    int nodes_initial, int growth, double pcg_tolerance, int pcg_max_iterations) {
+    int nodes_initial, int growth, double pcg_tolerance, int pcg_max_iterations,
+    bool use_device) {
     PreparedSolve prepared;
     nricp::Mesh template_mesh;
     template_mesh.vertices = to_points(template_points, "template_points");
@@ -603,7 +605,15 @@ PreparedSolve prepare_solve(
     graph_settings.levels = graph_levels;
     graph_settings.nodes_initial = nodes_initial;
     graph_settings.node_growth = growth;
-    prepared.graph = nricp::build_template_graph(template_mesh, graph_settings);
+    // The graph is template-side and independent of the target, so the
+    // accelerated route builds it on the device -- the construction is two
+    // sweeps of every vertex against every node of a level, and at a hundred
+    // thousand vertices that, not the solve, is where a single wrap's time goes.
+    // The core layer's builder stays as the reference the device one is checked
+    // against, and as the path taken when there is no device.
+    prepared.graph = use_device && nricp::device_graph_available()
+                         ? nricp::build_graph_on_device(template_mesh, graph_settings)
+                         : nricp::build_template_graph(template_mesh, graph_settings);
 
     // Both meshes (and the landmark targets) live in the graph's normalized
     // frame; the caller is responsible for the rigid alignment, which is what
@@ -876,7 +886,8 @@ PYBIND11_MODULE(nricp_dp, m) {
     m.def(
         "build_template_graph",
         [](const DoubleArray& points, const IndexArray& faces, int levels,
-           int nodes_initial, int growth, int max_nodes_per_vertex) {
+           int nodes_initial, int growth, int max_nodes_per_vertex,
+           bool use_device) {
             nricp::Mesh mesh;
             mesh.vertices = to_points(points, "points");
             mesh.faces = to_faces(faces, "faces");
@@ -887,7 +898,9 @@ PYBIND11_MODULE(nricp_dp, m) {
             settings.node_growth = growth;
             settings.max_nodes_per_vertex = max_nodes_per_vertex;
             const nricp::TemplateGraph graph =
-                nricp::build_template_graph(mesh, settings);
+                use_device && nricp::device_graph_available()
+                    ? nricp::build_graph_on_device(mesh, settings)
+                    : nricp::build_template_graph(mesh, settings);
             py::dict result;
             py::dict normalization;
             normalization["center"] = from_points({graph.normalization.center});
@@ -908,7 +921,7 @@ PYBIND11_MODULE(nricp_dp, m) {
         },
         py::arg("points"), py::arg("faces"), py::arg("levels") = 4,
         py::arg("nodes_initial") = 100, py::arg("growth") = 2,
-        py::arg("max_nodes_per_vertex") = 4,
+        py::arg("max_nodes_per_vertex") = 4, py::arg("use_device") = false,
         "Prepare the cached template side: nodes and bindings per level.");
 
     m.def(
@@ -1427,18 +1440,24 @@ PYBIND11_MODULE(nricp_dp, m) {
                     distance_threshold, min_normal_cosine, min_slope, initial_damping,
                     damping_decrease, damping_increase, max_damping_attempts,
                     diagonal_damping, graph_levels, nodes_initial, growth,
-                    pcg_tolerance, pcg_max_iterations);
-                const nricp::TargetQueries queries(prepared.normalized_target);
+                    pcg_tolerance, pcg_max_iterations, use_device);
                 const nricp::VertexMask* mask_pointer =
                     prepared.mask.active.empty() ? nullptr : &prepared.mask;
-                const nricp::RouteResult solved =
-                    use_device
-                        ? nricp::solve_route_b(prepared.normalized_template, queries,
-                                               prepared.graph, prepared.settings,
-                                               mask_pointer, prepared.landmarks)
-                        : nricp::solve_route_a(prepared.normalized_template, queries,
-                                               prepared.graph, prepared.settings,
-                                               mask_pointer, prepared.landmarks);
+                // The accelerated route builds its own query structure on the
+                // device, so the core layer's is only built for the route that
+                // traverses it.
+                nricp::RouteResult solved;
+                if (use_device) {
+                    solved = nricp::solve_route_b(
+                        prepared.normalized_template, prepared.normalized_target,
+                        prepared.graph, prepared.settings, mask_pointer,
+                        prepared.landmarks);
+                } else {
+                    const nricp::TargetQueries queries(prepared.normalized_target);
+                    solved = nricp::solve_route_a(
+                        prepared.normalized_template, queries, prepared.graph,
+                        prepared.settings, mask_pointer, prepared.landmarks);
+                }
                 return route_result_to_dict(solved, prepared.graph);
             },
             py::arg("template_points"), py::arg("template_faces"),
@@ -1499,13 +1518,14 @@ PYBIND11_MODULE(nricp_dp, m) {
                     distance_threshold, min_normal_cosine, min_slope,
                     initial_damping, damping_decrease, damping_increase,
                     max_damping_attempts, diagonal_damping, graph_levels,
-                    nodes_initial, growth, pcg_tolerance, pcg_max_iterations);
-                const nricp::TargetQueries queries(prepared.normalized_target);
+                    nodes_initial, growth, pcg_tolerance, pcg_max_iterations,
+                    /*use_device=*/true);
                 const nricp::VertexMask* mask_pointer =
                     prepared.mask.active.empty() ? nullptr : &prepared.mask;
-                return nricp::RouteBSession(prepared.normalized_template, queries,
-                                            prepared.graph, prepared.settings,
-                                            mask_pointer, prepared.landmarks);
+                return nricp::RouteBSession(
+                    prepared.normalized_template, prepared.normalized_target,
+                    prepared.graph, prepared.settings, mask_pointer,
+                    prepared.landmarks);
             }),
             py::arg("template_points"), py::arg("template_faces"),
             py::arg("target_points"), py::arg("target_faces"),

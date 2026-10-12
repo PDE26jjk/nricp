@@ -45,4 +45,11 @@ Deformation transfer_to_level(
     const Deformation& from_deformation,
     const GraphLevel& to);
 
+// Connects every node to its nearest neighbours, keeping each undirected pair
+// once and in a deterministic order. Exposed because the accelerated graph
+// builder derives the same edge set from the same nodes, so the rule has to live
+// in one place rather than in two that drift.
+std::vector<Int2> build_node_edges(
+    const std::vector<Vec3>& node_positions, int neighbours = 4);
+
 }  // namespace nricp

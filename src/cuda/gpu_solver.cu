@@ -2266,7 +2266,7 @@ bool RouteBSession::State::end_level() {
 
 RouteBSession::RouteBSession(
     const Mesh& normalized_template,
-    const TargetQueries& target,
+    const Mesh& normalized_target,
     const TemplateGraph& graph,
     const RouteSettings& settings,
     const VertexMask* mask,
@@ -2305,8 +2305,11 @@ RouteBSession::RouteBSession(
     session.deformation =
         identity_deformation(session.graph.levels.front().node_rest_positions);
 
-    // The target's hierarchy, built on the device and never read back.
-    session.hierarchy.build(target.mesh(), session.stream);
+    // The target's hierarchy, built on the device and never read back. The
+    // accelerated route takes the target as a mesh rather than as the core
+    // layer's query structure, because it builds its own: asking for one that
+    // this route never reads would be a whole host-side BVH per call.
+    session.hierarchy.build(normalized_target, session.stream);
     if (session.hierarchy.empty()) {
         session.finished = true;
         session.phase = State::Phase::Done;
@@ -2485,13 +2488,13 @@ RouteResult RouteBSession::result() const {
 
 RouteResult solve_route_b(
     const Mesh& normalized_template,
-    const TargetQueries& target,
+    const Mesh& normalized_target,
     const TemplateGraph& graph,
     const RouteSettings& settings,
     const VertexMask* mask,
     const std::vector<Landmark>& landmarks) {
-    RouteBSession session(normalized_template, target, graph, settings, mask,
-                          landmarks);
+    RouteBSession session(normalized_template, normalized_target, graph, settings,
+                          mask, landmarks);
     while (!session.finished()) {
         session.step();
     }

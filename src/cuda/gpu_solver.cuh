@@ -21,7 +21,7 @@ namespace nricp {
 // which level, which weights, damping, acceptance.
 RouteResult solve_route_b(
     const Mesh& normalized_template,
-    const TargetQueries& target,
+    const Mesh& normalized_target,
     const TemplateGraph& graph,
     const RouteSettings& settings,
     const VertexMask* mask,
@@ -55,7 +55,7 @@ class RouteBSession {
 public:
     RouteBSession(
         const Mesh& normalized_template,
-        const TargetQueries& target,
+        const Mesh& normalized_target,
         const TemplateGraph& graph,
         const RouteSettings& settings,
         const VertexMask* mask,

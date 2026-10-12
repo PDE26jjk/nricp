@@ -5,13 +5,11 @@
 #include <set>
 
 namespace nricp {
-namespace {
 
-// Connects every node to its nearest neighbours, keeping each undirected pair
-// once and in a deterministic order. Neighbour count is fixed rather than
-// radius-based so the edge set is a function of the node set alone.
-std::vector<Int2> build_edges(
-    const std::vector<Vec3>& node_positions, int neighbours = 4) {
+// Neighbour count is fixed rather than radius-based so the edge set is a
+// function of the node set alone.
+std::vector<Int2> build_node_edges(
+    const std::vector<Vec3>& node_positions, int neighbours) {
     std::set<std::pair<int, int>> unique;
     const int count = static_cast<int>(node_positions.size());
     for (int node = 0; node < count; ++node) {
@@ -39,8 +37,6 @@ std::vector<Int2> build_edges(
     }
     return edges;
 }
-
-}  // namespace
 
 TemplateGraph build_template_graph(
     const Mesh& template_mesh, const GraphSettings& settings) {
@@ -70,7 +66,7 @@ TemplateGraph build_template_graph(
         level_data.bindings = bind_vertices(
             normalized.vertices, level_data.node_rest_positions,
             settings.max_nodes_per_vertex);
-        level_data.edges = build_edges(level_data.node_rest_positions);
+        level_data.edges = build_node_edges(level_data.node_rest_positions);
         graph.levels.push_back(std::move(level_data));
     }
     return graph;
